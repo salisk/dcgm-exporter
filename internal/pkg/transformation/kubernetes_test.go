@@ -1800,6 +1800,177 @@ func TestPodMapperProcessAddsDRAAttributesForMIGMetric(t *testing.T) {
 	}
 }
 
+// TestPodMapperProcessDRALookupIndependentOfGPUIDType verifies that DRA metric
+// attribution does not depend on --kubernetes-gpu-id-type. DRA mappings are
+// keyed by GPU UUID (whole GPUs) or GPU instance identifier (MIG), so the DRA
+// branch resolves the lookup key from the metric itself: with the device-name
+// id type, whole-GPU metrics resolve to "nvidiaN", which never matches a DRA
+// key and previously left such metrics unattributed.
+func TestPodMapperProcessDRALookupIndependentOfGPUIDType(t *testing.T) {
+	testutils.RequireLinux(t)
+
+	tests := []struct {
+		name        string
+		deviceName  string
+		gpuUUID     string
+		migInfo     *DRAMigDeviceInfo
+		setupNVML   func(*mocknvmlprovider.MockNVML)
+		metric      collector.Metric
+		wantMIGUUID string
+	}{
+		{
+			name:       "whole GPU",
+			deviceName: "gpu-x",
+			gpuUUID:    "GPU-uuid-0",
+			metric: collector.Metric{
+				GPU:       "0",
+				GPUUUID:   "GPU-uuid-0",
+				GPUDevice: "nvidia0",
+				Value:     "42",
+			},
+		},
+		{
+			name:       "MIG device",
+			deviceName: "gpu-mig-x",
+			gpuUUID:    "GPU-parent-uuid",
+			migInfo: &DRAMigDeviceInfo{
+				MIGDeviceUUID: "MIG-12345",
+				Profile:       "1g.12gb",
+				ParentUUID:    "GPU-parent-uuid",
+			},
+			setupNVML: func(mockNVML *mocknvmlprovider.MockNVML) {
+				mockNVML.EXPECT().GetMIGDeviceInfoByID("MIG-12345").Return(&nvmlprovider.MIGDeviceInfo{
+					ParentUUID:    "GPU-parent-uuid",
+					GPUInstanceID: 3,
+				}, nil)
+			},
+			metric: collector.Metric{
+				GPU:           "0",
+				GPUUUID:       "MIG-12345",
+				GPUInstanceID: "3",
+				MigProfile:    "1g.12gb",
+				Value:         "42",
+			},
+			wantMIGUUID: "MIG-12345",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			if tc.setupNVML != nil {
+				realNVML := nvmlprovider.Client()
+				t.Cleanup(func() { nvmlprovider.SetClient(realNVML) })
+
+				mockNVMLProvider := mocknvmlprovider.NewMockNVML(ctrl)
+				tc.setupNVML(mockNVMLProvider)
+				nvmlprovider.SetClient(mockNVMLProvider)
+			}
+
+			tmpDir, cleanup := testutils.CreateTmpDir(t)
+			defer cleanup()
+			socketPath := filepath.Join(tmpDir, "kubelet.sock")
+
+			server := grpc.NewServer()
+			podresourcesapi.RegisterPodResourcesListerServer(server, &dynamicResourcePodResourcesServer{
+				response: &podresourcesapi.ListPodResourcesResponse{
+					PodResources: []*podresourcesapi.PodResources{{
+						Name:      "pod1",
+						Namespace: "default",
+						Containers: []*podresourcesapi.ContainerResources{{
+							Name: "ctr1",
+							DynamicResources: []*podresourcesapi.DynamicResource{{
+								ClaimName:      "claim1",
+								ClaimNamespace: "ns1",
+								ClaimResources: []*podresourcesapi.ClaimResource{{
+									DriverName: DRAGPUDriverName,
+									PoolName:   "poolA",
+									DeviceName: tc.deviceName,
+								}},
+							}},
+						}},
+					}},
+				},
+			})
+			cleanupServer := testutils.StartMockServer(t, server, socketPath)
+			defer cleanupServer()
+
+			clientset := fake.NewClientset(&v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pod1",
+					Namespace: "default",
+					UID:       types.UID("pod-uid-123"),
+				},
+			})
+
+			draManager := newTestDRAManagerWithDevices(map[string]testDRADeviceMapping{
+				draDeviceKey("poolA", tc.deviceName): {
+					uuid: tc.gpuUUID,
+					mig:  tc.migInfo,
+				},
+			})
+
+			pm := &PodMapper{
+				Config: &appconfig.Config{
+					KubernetesEnableDRA:       true,
+					KubernetesGPUIdType:       appconfig.DeviceName,
+					PodResourcesKubeletSocket: socketPath,
+					NvidiaResourceNames:       []string{appconfig.NvidiaResourceName},
+				},
+				ResourceSliceManager: draManager,
+				Client:               clientset,
+				labelFilterCache:     newLabelFilterCache(nil, 1000),
+				stopChan:             make(chan struct{}),
+			}
+			defer pm.Stop()
+			setupMockInformer(t, pm, clientset)
+
+			mockSystemInfo := mockdeviceinfo.NewMockProvider(ctrl)
+			mockSystemInfo.EXPECT().InfoType().Return(dcgm.FE_GPU).AnyTimes()
+			mockSystemInfo.EXPECT().GPUCount().Return(toUint(1)).AnyTimes()
+			gpu := deviceinfo.GPUInfo{DeviceInfo: dcgm.Device{UUID: tc.gpuUUID, GPU: 0}}
+			if tc.migInfo != nil {
+				gpu.GPUInstances = []deviceinfo.GPUInstanceInfo{{Info: dcgm.MigEntityInfo{NvmlInstanceId: 3}}}
+				gpu.MigEnabled = true
+			}
+			mockSystemInfo.EXPECT().GPU(toUint(0)).Return(gpu).AnyTimes()
+
+			counter := counters.Counter{
+				FieldID:   155,
+				FieldName: "DCGM_FI_DEV_POWER_USAGE",
+				PromType:  "gauge",
+			}
+			tc.metric.Counter = counter
+			tc.metric.Attributes = map[string]string{}
+			tc.metric.Labels = map[string]string{}
+			metrics := collector.MetricsByCounter{counter: []collector.Metric{tc.metric}}
+
+			err := pm.Process(metrics, mockSystemInfo)
+			require.NoError(t, err)
+			require.Len(t, metrics[counter], 1)
+
+			got := metrics[counter][0]
+			assert.Equal(t, "pod1", got.Attributes[podAttribute])
+			assert.Equal(t, "default", got.Attributes[namespaceAttribute])
+			assert.Equal(t, "ctr1", got.Attributes[containerAttribute])
+			assert.Equal(t, "claim1", got.Attributes[draClaimName])
+			assert.Equal(t, "ns1", got.Attributes[draClaimNamespace])
+			assert.Equal(t, DRAGPUDriverName, got.Attributes[draDriverName])
+			assert.Equal(t, "poolA", got.Attributes[draPoolName])
+			assert.Equal(t, tc.deviceName, got.Attributes[draDeviceName])
+			if tc.migInfo != nil {
+				assert.Equal(t, tc.migInfo.Profile, got.Attributes[draMigProfile])
+				assert.Equal(t, tc.wantMIGUUID, got.Attributes[draMigDeviceUUID])
+			} else {
+				assert.NotContains(t, got.Attributes, draMigProfile)
+				assert.NotContains(t, got.Attributes, draMigDeviceUUID)
+			}
+		})
+	}
+}
+
 func TestProcessPodMapper_WithUID(t *testing.T) {
 	testutils.RequireLinux(t)
 

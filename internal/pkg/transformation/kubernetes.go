@@ -564,12 +564,15 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 			for counter := range metrics {
 				var newmetrics []collector.Metric
 				for j, val := range metrics[counter] {
-					deviceID, err := val.GetIDOfType(p.Config.KubernetesGPUIdType)
+					// DRA mappings are keyed by GPU UUID (or GPU instance identifier
+					// for MIG), regardless of the configured GPU id type, so the
+					// lookup key is resolved as a UUID-type id.
+					lookupKey, err := val.GetIDOfType(appconfig.GPUUID)
 					if err != nil {
 						return err
 					}
 
-					podInfos := deviceToPodsDRA[deviceID]
+					podInfos := deviceToPodsDRA[lookupKey]
 					if podInfos != nil {
 						for _, pi := range podInfos {
 							metric := cloneMetric(metrics[counter][j])
