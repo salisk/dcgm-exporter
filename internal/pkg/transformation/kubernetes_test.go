@@ -1800,12 +1800,8 @@ func TestPodMapperProcessAddsDRAAttributesForMIGMetric(t *testing.T) {
 	}
 }
 
-// TestPodMapperProcessDRALookupIndependentOfGPUIDType verifies that DRA metric
-// attribution does not depend on --kubernetes-gpu-id-type. DRA mappings are
-// keyed by GPU UUID (whole GPUs) or GPU instance identifier (MIG), so the DRA
-// branch resolves the lookup key from the metric itself: with the device-name
-// id type, whole-GPU metrics resolve to "nvidiaN", which never matches a DRA
-// key and previously left such metrics unattributed.
+// TestPodMapperProcessDRALookupIndependentOfGPUIDType verifies that DRA
+// attribution works with every --kubernetes-gpu-id-type.
 func TestPodMapperProcessDRALookupIndependentOfGPUIDType(t *testing.T) {
 	testutils.RequireLinux(t)
 
@@ -2007,6 +2003,16 @@ func TestNeedsPerProcessAttribution(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "same pod name with different UIDs is not one owner",
+			pods: []PodInfo{draPod("default", "pod-a", "uid-1"), draPod("default", "pod-a", "uid-2")},
+			want: true,
+		},
+		{
+			name: "one entry with an unpopulated UID matches by name",
+			pods: []PodInfo{draPod("default", "pod-a", "uid-1"), draPod("default", "pod-a", "")},
+			want: false,
+		},
+		{
 			name: "same pod name in different namespaces is not one owner",
 			pods: []PodInfo{draPod("ns-1", "pod-a", "uid-1"), draPod("ns-2", "pod-a", "uid-2")},
 			want: true,
@@ -2129,16 +2135,20 @@ func TestMergeDRAIntoSharingPods(t *testing.T) {
 
 		require.Len(t, sharing["nvidia0"], 2)
 	})
+
+	t.Run("keeps a recreated pod with the same name but a new UID", func(t *testing.T) {
+		t.Parallel()
+		sharing := map[string][]PodInfo{"nvidia0": {newDRA("pod-a", "uid-1", "ctr")}}
+		dra := map[string][]PodInfo{"GPU-uuid-0": {newDRA("pod-a", "uid-2", "ctr")}}
+
+		mergeDRAIntoSharingPods(sharing, dra, map[string]string{"GPU-uuid-0": "nvidia0"})
+
+		require.Len(t, sharing["nvidia0"], 2)
+	})
 }
 
-// TestPodMapperProcessDRAPerProcessMetrics verifies per-process metric
-// attribution for DRA-allocated GPUs: a device claimed exclusively by a single
-// pod keeps the device-level value, while a device shared by multiple pods
-// gets per-process series plus the original device-level series. With
-// --kubernetes-virtual-gpus the DRA pods are included in the sharing map;
-// without it the DRA branch collects per-process data directly. NVML process
-// queries return no processes, so per-pod values are 0, which is the documented
-// upstream semantics for shared devices whose processes cannot be attributed.
+// TestPodMapperProcessDRAPerProcessMetrics verifies that an exclusive DRA claim
+// keeps the device-level value while a shared claim gets per-process series.
 func TestPodMapperProcessDRAPerProcessMetrics(t *testing.T) {
 	testutils.RequireLinux(t)
 
@@ -2356,8 +2366,7 @@ func TestPodMapperProcessDRAPerProcessMetrics(t *testing.T) {
 				assert.Equal(t, DRAGPUDriverName, m.Attributes[draDriverName])
 			}
 
-			// A shared device reports 0 per pod (no processes attributed);
-			// an exclusively claimed device keeps the device-level value.
+			// NVML reports no processes, so shared devices report 0 per pod.
 			wantPodValue := "0"
 			if tc.claimPods == 1 {
 				wantPodValue = "42"
@@ -2375,10 +2384,8 @@ func TestPodMapperProcessDRAPerProcessMetrics(t *testing.T) {
 	}
 }
 
-// TestPodMapperProcessDRAMIGPerProcessMetrics verifies per-process metrics for
-// a MIG instance allocated through DRA: an instance shared by two pods gets
-// per-process series, while a single claimant keeps the device-level value
-// without any NVML process queries.
+// TestPodMapperProcessDRAMIGPerProcessMetrics covers a MIG instance allocated
+// through DRA, shared by two pods or claimed by one.
 func TestPodMapperProcessDRAMIGPerProcessMetrics(t *testing.T) {
 	testutils.RequireLinux(t)
 
@@ -2629,9 +2636,8 @@ func TestPodMapper_CreatePerProcessMetrics_WithDRAPods(t *testing.T) {
 	}
 }
 
-// TestPodMapperProcessDRAMergeWithDevicePluginPods verifies the interaction of
-// device-plugin and DRA allocations on the same GPU under
-// --kubernetes-virtual-gpus.
+// TestPodMapperProcessDRAMergeWithDevicePluginPods covers device-plugin and DRA
+// allocations on the same GPU.
 func TestPodMapperProcessDRAMergeWithDevicePluginPods(t *testing.T) {
 	testutils.RequireLinux(t)
 

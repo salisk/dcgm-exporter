@@ -273,12 +273,6 @@ func (p *PodMapper) createPerProcessMetrics(
 	if len(devicePods) == 0 {
 		return nil, nil
 	}
-	if !needsPerProcessAttribution(devicePods) {
-		// The device is claimed exclusively by a single DRA pod, so the
-		// device-level value already is the per-pod value.
-		return nil, nil
-	}
-
 	data := dataMap.metrics[metricsKey]
 	podValues := buildPodValueMap(dataMap.pidToPod, data, counter.FieldName)
 	maps.Copy(podValues, buildIdlePodValues(podValues, devicePods))
@@ -438,8 +432,7 @@ func (p *PodMapper) getMappings(deviceInfo deviceinfo.Provider) (map[string][]Po
 	if p.Config.KubernetesEnableDRA {
 		deviceToPodsDRA = p.toDeviceToPodsDRA(pods, deviceInfo)
 		if p.Config.KubernetesVirtualGPUs && p.ResourceSliceManager != nil {
-			// Include DRA-allocated devices in the sharing map so they receive
-			// per-process metrics under --kubernetes-virtual-gpus.
+			// Add DRA pods so the sharing branch also attributes their usage.
 			mergeDRAIntoSharingPods(deviceToPods, deviceToPodsDRA,
 				getGPUUUIDToDeviceID(deviceInfo, p.Config.KubernetesGPUIdType))
 		}
@@ -574,10 +567,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 		if deviceToPodsDRA != nil {
 			slog.Debug(fmt.Sprintf("Device to pod mapping for DRA: %+v", deviceToPodsDRA))
 
-			// Collect per-process data for DRA-allocated devices shared by more
-			// than one pod; devices with a single claimant keep the device-level
-			// value (see needsPerProcessAttribution). DRA mappings are keyed by
-			// GPU UUID (or GPU instance identifier), so the identity map is used
+			// DRA mappings are keyed by GPU UUID (or GPU instance identifier),
 			// regardless of the configured GPU id type.
 			draProcessCollector := &perProcessCollector{
 				client:    nvmlprovider.Client(),
@@ -592,9 +582,6 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 			for counter := range metrics {
 				var newmetrics []collector.Metric
 				for j, val := range metrics[counter] {
-					// DRA mappings are keyed by GPU UUID (or GPU instance identifier
-					// for MIG), regardless of the configured GPU id type, so the
-					// lookup key is resolved as a UUID-type id.
 					lookupKey, err := val.GetIDOfType(appconfig.GPUUID)
 					if err != nil {
 						return err
@@ -670,8 +657,7 @@ func (p *PodMapper) addPodIdentityAttributes(metric *collector.Metric, podInfo P
 	}
 }
 
-// setDRAAttributes records Dynamic Resource Allocation (DRA) attributes on a
-// metric. It is a no-op when the pod has no DRA information.
+// setDRAAttributes adds DRA claim attributes; a no-op for non-DRA pods.
 func setDRAAttributes(attrs map[string]string, dr *DynamicResourceInfo) {
 	if dr == nil {
 		return
@@ -689,16 +675,9 @@ func setDRAAttributes(attrs map[string]string, dr *DynamicResourceInfo) {
 	}
 }
 
-// mergeDRAIntoSharingPods adds DRA-allocated pods to the virtual-GPU sharing
-// map under the key Process() will look up for the configured GPU id type.
-// Whole-GPU DRA keys are GPU UUIDs and are remapped to the configured id type;
-// MIG keys (GPU instance identifiers) are kept as-is because MIG metric lookups
-// do not depend on the id type. An entry is skipped when the target key
-// already holds an entry for the same pod and container (for example a
-// container that both uses a device-plugin device and holds a DRA claim on
-// the same GPU); the existing entry wins. Pods are identified by namespace and
-// name rather than UID because the UID is only populated once the informer
-// cache catches up.
+// mergeDRAIntoSharingPods adds DRA pods to the sharing map, remapping
+// whole-GPU UUID keys to the configured GPU id type. A pod and container
+// already present under the key (e.g. via the device plugin) is not added again.
 func mergeDRAIntoSharingPods(sharing, dra map[string][]PodInfo, uuidToDeviceID map[string]string) {
 	for key, podInfos := range dra {
 		targetKey := key
@@ -709,9 +688,7 @@ func mergeDRAIntoSharingPods(sharing, dra map[string][]PodInfo, uuidToDeviceID m
 		for _, podInfo := range podInfos {
 			duplicate := false
 			for _, entry := range existing {
-				if entry.Namespace == podInfo.Namespace &&
-					entry.Name == podInfo.Name &&
-					entry.Container == podInfo.Container {
+				if samePod(entry, podInfo) && entry.Container == podInfo.Container {
 					duplicate = true
 					break
 				}

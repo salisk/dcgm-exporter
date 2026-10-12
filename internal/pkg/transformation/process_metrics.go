@@ -125,8 +125,7 @@ func (c *perProcessCollector) processMIGEnabledGPU(
 	gpuUUID := gpu.DeviceInfo.UUID
 	gpuIndex := gpu.DeviceInfo.GPU
 
-	// Query NVML only when at least one instance on this GPU has pods;
-	// the result would be discarded otherwise.
+	// Skip the NVML query when no instance on this GPU has pods.
 	hasInstancePods := false
 	for _, instance := range gpu.GPUInstances {
 		migDeviceID := fmt.Sprintf("%d-%d", gpuIndex, instance.Info.NvmlInstanceId)
@@ -204,31 +203,30 @@ func (c *perProcessCollector) Collect(gpuDeviceMap map[string]string, deviceToPo
 	return result
 }
 
-// needsPerProcessAttribution reports whether per-pod values must be derived
-// from per-process data. It returns false only when every pod on the device
-// holds a DRA claim and all entries belong to the same pod: such a device is
-// claimed exclusively, so the device-level value already is the per-pod value
-// and does not depend on PID-to-pod mapping. Any other input returns true so
-// that device-plugin (non-DRA) pods keep per-process attribution.
-// Pods are identified by namespace and name rather than UID because the UID
-// is only populated once the informer cache catches up.
+// needsPerProcessAttribution returns false when a single DRA pod owns the
+// device, whose device-level value then is the per-pod value.
 func needsPerProcessAttribution(pods []PodInfo) bool {
 	if len(pods) == 0 {
 		return false
 	}
-	first := pods[0]
 	for _, podInfo := range pods {
-		if podInfo.DynamicResources == nil ||
-			podInfo.Namespace != first.Namespace || podInfo.Name != first.Name {
+		if podInfo.DynamicResources == nil || !samePod(podInfo, pods[0]) {
 			return true
 		}
 	}
 	return false
 }
 
-// filterPerProcessCandidates returns the device-to-pods entries that require
-// per-process collection, so NVML process queries are skipped for devices
-// claimed exclusively by a single DRA pod.
+// samePod compares pods by UID, falling back to namespace and name when a UID
+// is not populated yet (the informer cache may lag behind the kubelet).
+func samePod(a, b PodInfo) bool {
+	if a.UID != "" && b.UID != "" {
+		return a.UID == b.UID
+	}
+	return a.Namespace == b.Namespace && a.Name == b.Name
+}
+
+// filterPerProcessCandidates drops devices that need no per-process collection.
 func filterPerProcessCandidates(deviceToPods map[string][]PodInfo) map[string][]PodInfo {
 	filtered := make(map[string][]PodInfo, len(deviceToPods))
 	for key, pods := range deviceToPods {
