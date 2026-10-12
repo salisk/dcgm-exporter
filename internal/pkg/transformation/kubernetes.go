@@ -273,6 +273,11 @@ func (p *PodMapper) createPerProcessMetrics(
 	if len(devicePods) == 0 {
 		return nil, nil
 	}
+	if !needsPerProcessAttribution(devicePods) {
+		// The device is claimed exclusively by a single DRA pod, so the
+		// device-level value already is the per-pod value.
+		return nil, nil
+	}
 
 	data := dataMap.metrics[metricsKey]
 	podValues := buildPodValueMap(dataMap.pidToPod, data, counter.FieldName)
@@ -304,6 +309,7 @@ func (p *PodMapper) createPerProcessMetrics(
 		if podInfo.VGPU != "" {
 			metric.Attributes[vgpuAttribute] = podInfo.VGPU
 		}
+		setDRAAttributes(metric.Attributes, podInfo.DynamicResources)
 		if len(podInfo.Labels) > 0 {
 			copyPodLabels(&metric, podInfo.Labels, getMetricGroup())
 		}
@@ -431,6 +437,12 @@ func (p *PodMapper) getMappings(deviceInfo deviceinfo.Provider) (map[string][]Po
 
 	if p.Config.KubernetesEnableDRA {
 		deviceToPodsDRA = p.toDeviceToPodsDRA(pods, deviceInfo)
+		if p.Config.KubernetesVirtualGPUs && p.ResourceSliceManager != nil {
+			// Include DRA-allocated devices in the sharing map so they receive
+			// per-process metrics under --kubernetes-virtual-gpus.
+			mergeDRAIntoSharingPods(deviceToPods, deviceToPodsDRA,
+				getGPUUUIDToDeviceID(deviceInfo, p.Config.KubernetesGPUIdType))
+		}
 	}
 
 	return deviceToPods, deviceToPod, deviceToPodsDRA, nil
@@ -472,7 +484,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 			client:    nvmlprovider.Client(),
 			pidMapper: newPIDToPodMapper(),
 		}
-		perProcessData := processCollector.Collect(gpuUUIDToDeviceID, deviceToPods, deviceInfo)
+		perProcessData := processCollector.Collect(gpuUUIDToDeviceID, filterPerProcessCandidates(deviceToPods), deviceInfo)
 
 		for counter := range metrics {
 			var newmetrics []collector.Metric
@@ -506,6 +518,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 					if pi.VGPU != "" {
 						metric.Attributes[vgpuAttribute] = pi.VGPU
 					}
+					setDRAAttributes(metric.Attributes, pi.DynamicResources)
 					if len(pi.Labels) > 0 {
 						copyPodLabels(&metric, pi.Labels, getMetricGroup())
 					}
@@ -561,6 +574,21 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 		if deviceToPodsDRA != nil {
 			slog.Debug(fmt.Sprintf("Device to pod mapping for DRA: %+v", deviceToPodsDRA))
 
+			// Collect per-process data for DRA-allocated devices shared by more
+			// than one pod; devices with a single claimant keep the device-level
+			// value (see needsPerProcessAttribution). DRA mappings are keyed by
+			// GPU UUID (or GPU instance identifier), so the identity map is used
+			// regardless of the configured GPU id type.
+			draProcessCollector := &perProcessCollector{
+				client:    nvmlprovider.Client(),
+				pidMapper: newPIDToPodMapper(),
+			}
+			draPerProcessData := draProcessCollector.Collect(
+				getGPUUUIDToDeviceID(deviceInfo, appconfig.GPUUID),
+				filterPerProcessCandidates(deviceToPodsDRA),
+				deviceInfo,
+			)
+
 			for counter := range metrics {
 				var newmetrics []collector.Metric
 				for j, val := range metrics[counter] {
@@ -574,6 +602,23 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 
 					podInfos := deviceToPodsDRA[lookupKey]
 					if podInfos != nil {
+						if isPerProcessMetric(counter.FieldName) {
+							perProcessMetrics, err := p.createPerProcessMetrics(
+								val,
+								counter,
+								metrics[counter][j],
+								draPerProcessData,
+								getMetricGroup,
+							)
+							if err != nil {
+								return err
+							}
+							if perProcessMetrics != nil {
+								newmetrics = append(newmetrics, metrics[counter][j]) // original device-level metric
+								newmetrics = append(newmetrics, perProcessMetrics...)
+								continue
+							}
+						}
 						for _, pi := range podInfos {
 							metric := cloneMetric(metrics[counter][j])
 							p.addPodIdentityAttributes(&metric, pi)
@@ -641,6 +686,41 @@ func setDRAAttributes(attrs map[string]string, dr *DynamicResourceInfo) {
 		if migInfo.MIGDeviceUUID != "" {
 			attrs[draMigDeviceUUID] = migInfo.MIGDeviceUUID
 		}
+	}
+}
+
+// mergeDRAIntoSharingPods adds DRA-allocated pods to the virtual-GPU sharing
+// map under the key Process() will look up for the configured GPU id type.
+// Whole-GPU DRA keys are GPU UUIDs and are remapped to the configured id type;
+// MIG keys (GPU instance identifiers) are kept as-is because MIG metric lookups
+// do not depend on the id type. An entry is skipped when the target key
+// already holds an entry for the same pod and container (for example a
+// container that both uses a device-plugin device and holds a DRA claim on
+// the same GPU); the existing entry wins. Pods are identified by namespace and
+// name rather than UID because the UID is only populated once the informer
+// cache catches up.
+func mergeDRAIntoSharingPods(sharing, dra map[string][]PodInfo, uuidToDeviceID map[string]string) {
+	for key, podInfos := range dra {
+		targetKey := key
+		if deviceID, ok := uuidToDeviceID[key]; ok {
+			targetKey = deviceID
+		}
+		existing := sharing[targetKey]
+		for _, podInfo := range podInfos {
+			duplicate := false
+			for _, entry := range existing {
+				if entry.Namespace == podInfo.Namespace &&
+					entry.Name == podInfo.Name &&
+					entry.Container == podInfo.Container {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				existing = append(existing, podInfo)
+			}
+		}
+		sharing[targetKey] = existing
 	}
 }
 
