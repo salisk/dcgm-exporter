@@ -574,20 +574,7 @@ func (p *PodMapper) Process(metrics collector.MetricsByCounter, deviceInfo devic
 						for _, pi := range podInfos {
 							metric := cloneMetric(metrics[counter][j])
 							p.addPodIdentityAttributes(&metric, pi)
-							if dr := pi.DynamicResources; dr != nil {
-								metric.Attributes[draClaimName] = dr.ClaimName
-								metric.Attributes[draClaimNamespace] = dr.ClaimNamespace
-								metric.Attributes[draDriverName] = dr.DriverName
-								metric.Attributes[draPoolName] = dr.PoolName
-								metric.Attributes[draDeviceName] = dr.DeviceName
-
-								if migInfo := dr.MIGInfo; migInfo != nil {
-									metric.Attributes[draMigProfile] = migInfo.Profile
-									if migInfo.MIGDeviceUUID != "" {
-										metric.Attributes[draMigDeviceUUID] = migInfo.MIGDeviceUUID
-									}
-								}
-							}
+							setDRAAttributes(metric.Attributes, pi.DynamicResources)
 							if len(pi.Labels) > 0 {
 								copyPodLabels(&metric, pi.Labels, getMetricGroup())
 							}
@@ -632,6 +619,25 @@ func (p *PodMapper) addPodIdentityAttributes(metric *collector.Metric, podInfo P
 
 	if p.Config.KubernetesEnablePodUID {
 		metric.Attributes[uidAttribute] = podInfo.UID
+	}
+}
+
+// setDRAAttributes records Dynamic Resource Allocation (DRA) attributes on a
+// metric. It is a no-op when the pod has no DRA information.
+func setDRAAttributes(attrs map[string]string, dr *DynamicResourceInfo) {
+	if dr == nil {
+		return
+	}
+	attrs[draClaimName] = dr.ClaimName
+	attrs[draClaimNamespace] = dr.ClaimNamespace
+	attrs[draDriverName] = dr.DriverName
+	attrs[draPoolName] = dr.PoolName
+	attrs[draDeviceName] = dr.DeviceName
+	if migInfo := dr.MIGInfo; migInfo != nil {
+		attrs[draMigProfile] = migInfo.Profile
+		if migInfo.MIGDeviceUUID != "" {
+			attrs[draMigDeviceUUID] = migInfo.MIGDeviceUUID
+		}
 	}
 }
 
